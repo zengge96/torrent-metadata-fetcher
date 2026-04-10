@@ -83,6 +83,96 @@ def query_tracker(tracker_url, info_hash):
     except:
         return None
 
+# 缓存已获取过metadata的torrent，避免重复
+metadata_cache = {"abe3a463c0a9a06fed5bfe19e17cfabc70ab58a1": "/tmp/pursuit_of_jade.torrent"}
+
+def fetch_metadata(info_hash, peer_list, timeout=30):
+    """
+    使用libtorrent从peer获取metadata
+    返回: (torrent文件路径, torrent_info_dict) 或 (None, None)
+    """
+    if not HAS_LT:
+        return None, None
+    
+    ih_hex = info_hash if isinstance(info_hash, str) else info_hash.hex()
+    
+    # 检查缓存
+    if ih_hex in metadata_cache and os.path.exists(metadata_cache[ih_hex]):
+        return metadata_cache[ih_hex], None
+    
+    try:
+        # 创建新的session
+        ses = lt.session()
+        ses.listen_on(0, 0)
+        
+        atp = lt.add_torrent_params()
+        atp.info_hash = lt.sha1_hash(bytes.fromhex(ih_hex))
+        atp.save_path = "/tmp/torrents_metadata"
+        atp.trackers = ["http://pybittrack.retiolus.net/announce"]
+        atp.flags |= lt.torrent_flags.upload_mode  # 只下载metadata
+        
+        handle = ses.add_torrent(atp)
+        
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                if handle.is_valid() and handle.has_metadata():
+                    ti = handle.get_torrent_info()
+                    
+                    # 生成torrent文件
+                    ct = lt.create_torrent(ti)
+                    tor = ct.generate()
+                    data = lt.bencode(tor)
+                    
+                    # 保存
+                    torrent_path = f"/tmp/torrents_metadata/{ih_hex}.torrent"
+                    os.makedirs("/tmp/torrents_metadata", exist_ok=True)
+                    with open(torrent_path, "wb") as f:
+                        f.write(data)
+                    
+                    # 提取信息
+                    torrent_info = {
+                        "name": ti.name(),
+                        "size": ti.total_size(),
+                        "files": [],
+                        "piece_length": ti.piece_length(),
+                        "num_pieces": ti.num_pieces()
+                    }
+                    
+                    # 文件列表
+                    if ti.num_files() > 1:
+                        for i in range(ti.num_files()):
+                            f = ti.files().at(i)
+                            torrent_info["files"].append({
+                                "path": f.path,
+                                "size": f.size
+                            })
+                    else:
+                        torrent_info["files"].append({
+                            "path": ti.name(),
+                            "size": ti.total_size()
+                        })
+                    
+                    # 清理session
+                    ses.remove_torrent(handle)
+                    return torrent_path, torrent_info
+                    
+            except Exception as e:
+                pass
+            
+            time.sleep(1)
+        
+        # 超时，清理
+        try:
+            ses.remove_torrent(handle)
+        except:
+            pass
+        
+    except Exception as e:
+        print(f"[metadata] 获取失败 {ih_hex[:8]}: {e}")
+    
+    return None, None
+
 # 示例torrent数据 (包含文件名)
 # 真实torrent数据 (通过magnet获取metadata)
 real_torrents = {
@@ -130,25 +220,51 @@ def discover():
                             ip = ".".join(str(b) for b in peers_data[j:j+4])
                             port = int.from_bytes(peers_data[j+4:j+6], 'big')
                             peers.append(f"{ip}:{port}")
-                    with lock:
-                        if ih.hex() not in torrents:
-                            torrents[ih.hex()] = {"info_hash": ih.hex(), "peers": peers, "count": len(peers)}
-                            print(f"[*] Tracker: {ih.hex()[:16]}... ({len(peers)} peers)")
-                    break
-        
-        # DHT查询 (每3次查询一次)
-        if lt_session and random.random() < 0.4:
-            ih2 = bytes([random.randint(0,255) for _ in range(20)])
-            dht_peers = query_dht(lt_session, ih2)
-            if dht_peers:
+                with lock:
+                    ih_hex = ih.hex()
+                    if ih_hex not in torrents:
+                        torrents[ih_hex] = {"info_hash": ih_hex, "peers": peers, "count": len(peers)}
+                        print(f"[*] Tracker: {ih_hex[:16]}... ({len(peers)} peers)")
+
+                        def get_meta():
+                            path, info = fetch_metadata(ih_hex, peers, timeout=45)
+                            if path and info:
+                                with lock:
+                                    if ih_hex in torrents:
+                                        torrents[ih_hex]["torrent_file"] = path
+                                        torrents[ih_hex]["name"] = info["name"]
+                                        torrents[ih_hex]["size"] = info["size"]
+                                        torrents[ih_hex]["files"] = [f["path"] for f in info["files"]]
+                                        print(f"[+] Metadata: {info['name'][:40]}")
+                                        metadata_cache[ih_hex] = path
+
+                        threading.Thread(target=get_meta, daemon=True).start()
+                        break
+
+                # DHT查询 (每3次查询一次)
+                with lock:
+                    h = ih2.hex()
                 with lock:
                     h = ih2.hex()
                     if h not in torrents:
                         torrents[h] = {"info_hash": h, "peers": dht_peers, "count": len(dht_peers)}
                         print(f"[*] DHT: {h[:16]}... ({len(dht_peers)} peers)")
-        
-        time.sleep(0.3)
 
+                        def get_meta_dht():
+                            path, info = fetch_metadata(h, dht_peers, timeout=45)
+                            if path and info:
+                                with lock:
+                                    if h in torrents:
+                                        torrents[h]["torrent_file"] = path
+                                        torrents[h]["name"] = info["name"]
+                                        torrents[h]["size"] = info["size"]
+                                        torrents[h]["files"] = [f["path"] for f in info["files"]]
+                                        print(f"[+] DHT Metadata: {info['name'][:40]}")
+                                        metadata_cache[h] = path
+
+                        threading.Thread(target=get_meta_dht, daemon=True).start()
+
+                time.sleep(0.3)
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/api/stats":
