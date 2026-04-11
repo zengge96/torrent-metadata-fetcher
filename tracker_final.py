@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-import urllib.request
-import urllib.parse
-import bencodepy
-import random
-import time
-import threading
+"""BitTorrent Tracker + DHT Spider"""
+import urllib.request, urllib.parse, bencodepy, random, time, threading, socket, struct, os
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json
 from urllib.parse import parse_qs, urlparse
-import os
 
 try:
     import libtorrent as lt
@@ -17,202 +12,158 @@ except:
     HAS_LT = False
 
 HTTP_PORT = 8080
-
-TRACKERS = [
-    "http://pybittrack.retiolus.net/announce",
-    "http://tracker.mywaifu.best:6969/announce",
-]
+DHT_PORT = 6881
+TRACKERS = ["http://pybittrack.retiolus.net/announce", "http://tracker.mywaifu.best:6969/announce"]
+BOOTSTRAP = [("router.bittorrent.com", 6881), ("dht.transmissionbt.com", 6881), ("router.utorrent.com", 6881)]
 
 torrents = {}
 lock = threading.Lock()
 lt_session = None
 
+REAL_INFO_HASHES = []
+try:
+    with open("/root/.openclaw/workspace/real_info_hashes.json") as f:
+        REAL_INFO_HASHES = json.load(f)
+    print(f"[*] Loaded {len(REAL_INFO_HASHES)} real info_hashes")
+except: pass
+
+import bencodepy as bencoder
+
+# ===== DHT Spider =====
+class DHTSpider:
+    def __init__(self, port=DHT_PORT):
+        self.port = port
+        self.nid = os.urandom(20)
+        self.nodes = []
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.settimeout(1)
+        self.running = False
+        self.info_hashes = set()
+        
+    def send_krpc(self, msg, addr):
+        try: self.sock.sendto(bencoder.encode(msg), addr)
+        except: pass
+        
+    def send_find_node(self, addr, target=None):
+        target = target or os.urandom(20)
+        nid = target[:14] + os.urandom(6)
+        msg = {b"t": os.urandom(2), b"y": b"q", b"q": b"find_node", 
+               b"a": {b"id": nid, b"target": target}}
+        self.send_krpc(msg, addr)
+        
+    def parse_nodes(self, data):
+        result = []
+        for i in range(0, len(data), 26):
+            if i+26 <= len(data):
+                nid = data[i:i+20]
+                ip = ".".join(str(b) for b in data[i+20:i+24])
+                port = struct.unpack("!H", data[i+24:i+26])[0]
+                result.append((nid, ip, port))
+        return result
+        
+    def handle_msg(self, msg, addr):
+        try:
+            if msg.get(b"y") == b"r":
+                nodes = msg.get(b"r", {}).get(b"nodes", b"")
+                if nodes:
+                    self.nodes.extend(self.parse_nodes(nodes))
+            elif msg.get(b"y") == b"q":
+                q = msg.get(b"q", b"")
+                if q == b"get_peers" or q == b"announce_peer":
+                    ih = msg.get(b"a", {}).get(b"info_hash")
+                    if ih:
+                        ih_hex = ih.hex()
+                        if ih_hex not in self.info_hashes:
+                            self.info_hashes.add(ih_hex)
+                            print(f"[DHT] Found: {ih_hex}")
+                            with lock:
+                                if ih_hex not in torrents:
+                                    torrents[ih_hex] = {"info_hash": ih_hex, "peers": [], "count": 0}
+                                    threading.Thread(target=self.get_meta, args=(ih_hex,), daemon=True).start()
+        except: pass
+        
+    def get_meta(self, info_hash):
+        if not HAS_LT: return
+        try:
+            h = lt_session.add_torrent({"info_hash": info_hash, "name": info_hash})
+            for _ in range(30):
+                time.sleep(1)
+                if h.has_metadata():
+                    ti = h.get_torrent_info()
+                    with lock:
+                        if info_hash in torrents:
+                            torrents[info_hash]["name"] = ti.name()
+                            torrents[info_hash]["size"] = ti.total_size()
+                            torrents[info_hash]["has_metadata"] = True
+                            print(f"[DHT] Metadata: {ti.name()[:40]}")
+                    break
+        except Exception as e: print(f"[DHT] Error: {e}")
+        
+    def run(self):
+        try: self.sock.bind(("0.0.0.0", self.port))
+        except: print("[DHT] Port busy"); return
+        print(f"[DHT] Listening on {self.port}")
+        self.running = True
+        for a in BOOTSTRAP: self.send_find_node(a)
+        last_bootstrap = time.time()
+        while self.running:
+            try:
+                data, addr = self.sock.recvfrom(65535)
+                self.handle_msg(bencoder.decode(data), addr)
+            except socket.timeout:
+                if time.time() - last_bootstrap > 20:
+                    for a in BOOTSTRAP: self.send_find_node(a)
+                    last_bootstrap = time.time()
+            except: pass
+
+# ===== Original functions =====
 def init_dht():
     global lt_session
-    if not HAS_LT:
-        return None
-    
-    print("[DHT] 初始化DHT...")
-    ses = lt.session()
-    ses.listen_on(0, 0)
-    
-    # DHT bootstrap nodes
-    ses.add_dht_router("router.bittorrent.com", 6881)
-    ses.add_dht_router("dht.transmissionbt.com", 6881)
-    ses.add_dht_router("router.utorrent.com", 6881)
-    
-    ses.start_dht()
-    
-    # 等待bootstrap
-    for i in range(20):
+    if not HAS_LT: return None
+    print("[DHT] Init libtorrent...")
+    s = lt.session()
+    s.listen_on(0, 0)
+    for a in BOOTSTRAP: s.add_dht_router(a[0], a[1])
+    s.start_dht()
+    for _ in range(10):
         time.sleep(1)
-        try:
-            if ses.status().dht_nodes > 0:
-                print(f"[DHT] Bootstrap完成，nodes: {ses.status().dht_nodes}")
-                return ses
-        except:
-            pass
-    
-    print("[DHT] Bootstrap超时，继续运行")
-    return ses
+        if s.status().dht_nodes > 0:
+            print(f"[DHT] Nodes: {s.status().dht_nodes}")
+            break
+    return s
 
-def query_dht(ses, info_hash):
-    if not ses:
-        return []
+def query_tracker(tr, ih):
     try:
-        ih = lt.sha1_hash(info_hash)
-        ses.dht_get_peers(ih)
-        time.sleep(0.5)
-        
-        alerts = ses.pop_alerts()
-        peers = []
-        for a in alerts:
-            if hasattr(a, 'peers'):
-                for p in a.peers:
-                    peers.append(f"{p.ip}:{p.port}")
-        return list(set(peers))
-    except:
-        return []
+        url = f"{tr}?info_hash={ih.hex()}&peer_id=00112233445566778899&port=6881&uploaded=0&downloaded=0&left=0"
+        return bencoder.decode(urllib.request.urlopen(url, timeout=5).read())
+    except: return None
 
-def query_tracker(tracker_url, info_hash):
-    try:
-        q = f"info_hash={urllib.parse.quote(info_hash, safe='')}&peer_id=-UT0000-00000000&port=6881&left=1&compact=1"
-        req = urllib.request.Request(tracker_url + "?" + q, headers={"User-Agent": "uTorrent/3.5"})
-        resp = urllib.request.urlopen(req, timeout=5)
-        return bencodepy.decode(resp.read())
-    except:
-        return None
-
-# 缓存已获取过metadata的torrent，避免重复
-metadata_cache = {"abe3a463c0a9a06fed5bfe19e17cfabc70ab58a1": "/tmp/pursuit_of_jade.torrent"}
-
-def fetch_metadata(info_hash, peer_list, timeout=30):
-    """
-    使用libtorrent从peer获取metadata
-    返回: (torrent文件路径, torrent_info_dict) 或 (None, None)
-    """
-    if not HAS_LT:
-        return None, None
-    
-    ih_hex = info_hash if isinstance(info_hash, str) else info_hash.hex()
-    
-    # 检查缓存
-    if ih_hex in metadata_cache and os.path.exists(metadata_cache[ih_hex]):
-        return metadata_cache[ih_hex], None
-    
-    try:
-        # 创建新的session
-        ses = lt.session()
-        ses.listen_on(0, 0)
-        
-        atp = lt.add_torrent_params()
-        atp.info_hash = lt.sha1_hash(bytes.fromhex(ih_hex))
-        atp.save_path = "/tmp/torrents_metadata"
-        atp.trackers = ["http://pybittrack.retiolus.net/announce"]
-        atp.flags |= lt.torrent_flags.upload_mode  # 只下载metadata
-        
-        handle = ses.add_torrent(atp)
-        
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                if handle.is_valid() and handle.has_metadata():
-                    ti = handle.get_torrent_info()
-                    
-                    # 生成torrent文件
-                    ct = lt.create_torrent(ti)
-                    tor = ct.generate()
-                    data = lt.bencode(tor)
-                    
-                    # 保存
-                    torrent_path = f"/tmp/torrents_metadata/{ih_hex}.torrent"
-                    os.makedirs("/tmp/torrents_metadata", exist_ok=True)
-                    with open(torrent_path, "wb") as f:
-                        f.write(data)
-                    
-                    # 提取信息
-                    torrent_info = {
-                        "name": ti.name(),
-                        "size": ti.total_size(),
-                        "files": [],
-                        "piece_length": ti.piece_length(),
-                        "num_pieces": ti.num_pieces()
-                    }
-                    
-                    # 文件列表
-                    if ti.num_files() > 1:
-                        for i in range(ti.num_files()):
-                            f = ti.files().at(i)
-                            torrent_info["files"].append({
-                                "path": f.path,
-                                "size": f.size
-                            })
-                    else:
-                        torrent_info["files"].append({
-                            "path": ti.name(),
-                            "size": ti.total_size()
-                        })
-                    
-                    # 清理session
-                    ses.remove_torrent(handle)
-                    return torrent_path, torrent_info
-                    
-            except Exception as e:
-                pass
-            
-            time.sleep(1)
-        
-        # 超时，清理
-        try:
-            ses.remove_torrent(handle)
-        except:
-            pass
-        
-    except Exception as e:
-        print(f"[metadata] 获取失败 {ih_hex[:8]}: {e}")
-    
-    return None, None
-
-# 示例torrent数据 (包含文件名)
-# 真实torrent数据 (通过magnet获取metadata)
-real_torrents = {
-    "abe3a463c0a9a06fed5bfe19e17cfabc70ab58a1": {
-        "info_hash": "abe3a463c0a9a06fed5bfe19e17cfabc70ab58a1",
-        "name": "逐玉 Pursuit of Jade S01 2026 2160p WEB-DL 40集全",
-        "files": [f"Pursuit.of.Jade.S01E{i:02d}.2026.2160p.IQ.WEB-DL.H265.DDP5.1-BlackTV.mkv" for i in range(1, 41)],
-        "size": 48.99 * 1024 * 1024 * 1024,
-        "peers": ["已连接 (2 peers)"],
-        "count": 2,
-        "torrent_file": "/tmp/pursuit_of_jade.torrent"
-    },
-}
-
-sample_torrents = {
-    "58907c1e092a52dfa46a530a2a47934d208979a7": {"info_hash": "58907c1e092a52dfa46a530a2a47934d208979a7", "name": "Ubuntu 22.04 Desktop ISO", "files": ["ubuntu-22.04-desktop-amd64.iso"], "size": 4500000000, "peers": ["152.69.198.80:6881"], "count": 1},
-    "d0p3m5n0r1l0p2q4r6s8t0u2v4w6x8y0z2": {"info_hash": "d0p3m5n0r1l0p2q4r6s8t0u2v4w6x8y0z2", "name": "Windows 11 Pro ISO", "files": ["windows-11-pro-x64.iso"], "size": 5600000000, "peers": ["203.0.113.50:6881"], "count": 1},
-    "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6": {"info_hash": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6", "name": "Debian 12 DVD ISO", "files": ["debian-12.0.0-dvd-1.iso"], "size": 3700000000, "peers": ["198.51.100.10:6881"], "count": 1},
-    "f5e8d2c1a0b9e8f7d6c5b4a3e9d8c7f6": {"info_hash": "f5e8d2c1a0b9e8f7d6c5b4a3e9d8c7f6", "name": "Fedora Workstation 39", "files": ["fedora-workstation-39-x86_64.iso"], "size": 2000000000, "peers": ["192.0.2.100:6881"], "count": 1},
-    "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7": {"info_hash": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7", "name": "Linux Mint 21", "files": ["linuxmint-21-cinnamon-x64.iso"], "size": 2500000000, "peers": ["203.0.113.25:6881"], "count": 1},
-}
-# 合并示例数据到torrents
-torrents.update(real_torrents)
-torrents.update(sample_torrents)
+def get_torrent_name(info_hash):
+    """从REAL_INFO_HASHES获取torrent名称"""
+    for rh in REAL_INFO_HASHES:
+        if rh["info_hash"] == info_hash:
+            return rh.get("name", "")[:50]
+    return ""
 
 def discover():
-    global torrents, lt_session
-    print("[*] Starting torrent discovery...")
-    
-    # 初始化DHT
+    global lt_session
+    print("[*] Starting...")
     lt_session = init_dht()
-    
+    idx = 0
     while True:
-        ih = bytes([random.randint(0,255) for _ in range(20)])
-        
-        # Tracker查询
+        if REAL_INFO_HASHES:
+            ih_hex = REAL_INFO_HASHES[idx % len(REAL_INFO_HASHES)]["info_hash"]
+            ih = bytes.fromhex(ih_hex)
+            idx += 1
+        else:
+            ih = bytes([random.randint(0,255) for _ in range(20)])
+            ih_hex = ih.hex()
+            
         for tr in TRACKERS:
-            result = query_tracker(tr, ih)
-            if result and b"peers" in result:
-                peers_data = result.get(b"peers", b"")
+            r = query_tracker(tr, ih)
+            if r and b"peers" in r:
+                peers_data = r.get(b"peers", b"")
                 if len(peers_data) > 0:
                     peers = []
                     for j in range(0, len(peers_data), 6):
@@ -220,166 +171,79 @@ def discover():
                             ip = ".".join(str(b) for b in peers_data[j:j+4])
                             port = int.from_bytes(peers_data[j+4:j+6], 'big')
                             peers.append(f"{ip}:{port}")
-                with lock:
-                    ih_hex = ih.hex()
-                    if ih_hex not in torrents:
-                        torrents[ih_hex] = {"info_hash": ih_hex, "peers": peers, "count": len(peers)}
-                        print(f"[*] Tracker: {ih_hex[:16]}... ({len(peers)} peers)")
+                    
+                    # 获取torrent名称
+                    name = get_torrent_name(ih_hex)
+                    
+                    with lock:
+                        if ih_hex not in torrents:
+                            torrents[ih_hex] = {"info_hash": ih_hex, "peers": peers, "count": len(peers), "name": name}
+                            print(f"[*] {ih_hex[:16]}... ({len(peers)} peers) - {name[:30]}")
+        time.sleep(1)
 
-                        def get_meta():
-                            path, info = fetch_metadata(ih_hex, peers, timeout=45)
-                            if path and info:
-                                with lock:
-                                    if ih_hex in torrents:
-                                        torrents[ih_hex]["torrent_file"] = path
-                                        torrents[ih_hex]["name"] = info["name"]
-                                        torrents[ih_hex]["size"] = info["size"]
-                                        torrents[ih_hex]["files"] = [f["path"] for f in info["files"]]
-                                        print(f"[+] Metadata: {info['name'][:40]}")
-                                        metadata_cache[ih_hex] = path
-
-                        threading.Thread(target=get_meta, daemon=True).start()
-                        break
-
-                # DHT查询 (每3次查询一次)
-                with lock:
-                    h = ih2.hex()
-                with lock:
-                    h = ih2.hex()
-                    if h not in torrents:
-                        torrents[h] = {"info_hash": h, "peers": dht_peers, "count": len(dht_peers)}
-                        print(f"[*] DHT: {h[:16]}... ({len(dht_peers)} peers)")
-
-                        def get_meta_dht():
-                            path, info = fetch_metadata(h, dht_peers, timeout=45)
-                            if path and info:
-                                with lock:
-                                    if h in torrents:
-                                        torrents[h]["torrent_file"] = path
-                                        torrents[h]["name"] = info["name"]
-                                        torrents[h]["size"] = info["size"]
-                                        torrents[h]["files"] = [f["path"] for f in info["files"]]
-                                        print(f"[+] DHT Metadata: {info['name'][:40]}")
-                                        metadata_cache[h] = path
-
-                        threading.Thread(target=get_meta_dht, daemon=True).start()
-
-                time.sleep(0.3)
-class Handler(BaseHTTPRequestHandler):
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
     def do_GET(self):
         if self.path == "/api/stats":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"total": len(torrents)}).encode())
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
+            with lock: self.wfile.write(json.dumps({"total": len(torrents)}).encode())
         elif self.path.startswith("/api/search"):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            query = parse_qs(urlparse(self.path).query).get("q", [""])[0].lower()
-            with lock:
-                if query:
-                    data = [v for v in torrents.values() 
-                           if query in v.get("info_hash", "").lower() 
-                           or query in v.get("name", "").lower()
-                           or any(query in f.lower() for f in v.get("files", []))][:50]
-                else:
-                    data = list(torrents.values())[:50]
-            self.wfile.write(json.dumps(data, ensure_ascii=False).encode())
+            q = parse_qs(urlparse(self.path).query).get("q", [""])[0].lower()
+            with lock: results = [{"info_hash": k, **v} for k,v in torrents.items() if q in v.get("name","").lower() or q in k]
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
+            self.wfile.write(json.dumps(results).encode())
         elif self.path.startswith("/api/torrent/"):
             info_hash = self.path.split("/api/torrent/")[1].strip("/")
-            with lock:
-                t = torrents.get(info_hash)
-            if t:
-                # 优先使用真实torrent文件
-                torrent_file = t.get("torrent_file")
-                if torrent_file and os.path.exists(torrent_file):
-                    with open(torrent_file, "rb") as f:
-                        encoded = f.read()
-                else:
-                    import bencodepy
-                    name = t.get("name", info_hash)
-                    torrent_data = {
-                        b"announce": b"http://pybittrack.retiolus.net/announce",
-                        b"info": {
-                            b"name": name.encode() if isinstance(name, str) else name,
-                            b"piece length": b"262144",
-                            b"pieces": b""
-                        }
-                    }
-                    encoded = bencodepy.encode(torrent_data)
-                self.send_response(200)
-                self.send_header("Content-Type", "application/x-bittorrent")
-                self.send_header("Content-Disposition", f'attachment; filename="{info_hash}.torrent"')
-                self.end_headers()
-                self.wfile.write(encoded)
-            else:
-                self.send_response(404)
-                self.end_headers()
-                self.wfile.write(b"Not found")
+            with lock: t = torrents.get(info_hash)
+            if t and t.get("torrent_file"):
+                try:
+                    with open(t["torrent_file"], "rb") as f: data = f.read()
+                    self.send_response(200); self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Disposition", f"attachment; filename={info_hash}.torrent")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                except: pass
+            self.send_response(404); self.end_headers()
         else:
-            html = """
-<html>
-<head>
-<meta charset="utf-8">
-<title>Torrent Search</title>
-<style>
-body{background:#111;color:#eee;font-family:Arial;max-width:900px;margin:40px auto;padding:20px}
-h1{color:#58a6ff}
-input{padding:12px;width:60%;font-size:16px;background:#222;color:#fff;border:1px solid #444;border-radius:4px}
-button{padding:12px 25px;font-size:16px;background:#238636;color:#fff;border:none;border-radius:4px;cursor:pointer}
-.result{background:#222;padding:12px;margin:8px 0;border-left:3px solid #238636;border-radius:4px}
-.result .hash{color:#58a6ff;font-family:monospace;font-size:14px}
-.result .info{color:#888;font-size:12px;margin-top:5px}
-.stats{background:#161b22;padding:15px;border-radius:8px;margin:20px 0}
-.stats span{color:#4f4;font-weight:bold;font-size:20px}
-</style>
-</head>
-<body>
-<h1>Torrent Tracker + DHT Search</h1>
-<div class="stats">
-Found: <span id="c">0</span> torrents | Trackers: pybittrack, mywaifu | DHT: Enabled
-</div>
-<form action="/search">
-<input type="text" name="q" placeholder="Search by filename or hash..." autofocus>
-<button type="submit">Search</button>
-</form>
+            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.end_headers()
+            html = '''<html><head><meta charset="utf-8"><title>DHT Tracker</title>
+<style>body{background:#111;color:#eee;font-family:Arial;max-width:900px;margin:40px auto;padding:20px}
+h1{color:#58a6ff}input{padding:12px;width:60%;font-size:16px;background:#222;color:#fff;border:1px solid #444}
+button{padding:12px 25px;font-size:16px;background:#238636;color:#fff;border:none;cursor:pointer}
+.result{background:#222;padding:12px;margin:8px 0;border-left:3px solid #238636}
+.result .hash{color:#58a6ff;font-family:monospace}.result .info{color:#888;font-size:12px}
+.stats{background:#161b22;padding:15px;border-radius:8px;margin:20px 0}.stats span{color:#4f;font-weight:bold;font-size:20px}
+</style></head>
+<body><h1>DHT爬虫 + Tracker</h1>
+<div class="stats">Found: <span id="c">0</span> torrents</div>
+<form action="/search"><input type="text" name="q" placeholder="Search by name or hash" autofocus><button>Search</button></form>
 <div id="results"></div>
 <script>
-function updateCount(){
-  fetch('/api/stats').then(r=>r.json()).then(d=>document.getElementById('c').innerText=d.total)
-}
-setInterval(updateCount,3000);
-updateCount();
+function updateCount(){fetch('/api/stats').then(r=>r.json()).then(d=>document.getElementById('c').innerText=d.total)}
+setInterval(updateCount,3000);updateCount();
 const params=new URLSearchParams(window.location.search);
 const q=params.get('q');
 if(q){
   fetch('/api/search?q='+encodeURIComponent(q)).then(r=>r.json()).then(d=>{
-    let h='<h3>Search Results: '+d.length+'</h3>';
+    let h='<h3>Results: '+d.length+'</h3>';
     d.forEach(x=>{
       h+='<div class="result">';
       h+='<div class="hash">'+(x.name||x.info_hash)+'</div>';
       h+='<div class="info">Size: '+(x.size?(x.size/1024/1024/1024).toFixed(1)+' GB':'N/A')+'</div>';
-      if(x.files && x.files.length>0){
-        h+='<div class="info">Files: '+x.files.join(', ')+'</div>';
-      }
-      h+='<div class="info">Peers: '+x.count+' | '+x.peers.join(', ')+'</div>';
+      h+='<div class="info">Peers: '+x.count+'</div>';
       h+='<div class="info">magnet:?xt=urn:btih:'+x.info_hash+'</div>';
-      h+='<div class="info"><a href="/api/torrent/'+x.info_hash+'" style="color:#4f4;" download>⬇ Download .torrent</a></div>';
+      h+='<div class="info"><a href="/api/torrent/'+x.info_hash+'" style="color:#4f" download>Download .torrent</a></div>';
       h+='</div>';
     });
     document.getElementById('results').innerHTML=h;
   });
 }
-</script>
-</body>
-</html>"""
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(html.encode("utf-8"))
+</script></body></html>'''
+            self.wfile.write(html.encode())
 
-threading.Thread(target=discover, daemon=True).start()
-server = HTTPServer(("", HTTP_PORT), Handler)
-print(f"[*] Server started: http://localhost:{HTTP_PORT}")
-server.serve_forever()
+if __name__ == "__main__":
+    print("[*] Starting DHT Tracker...")
+    threading.Thread(target=lambda: DHTSpider(DHT_PORT).run(), daemon=True).start()
+    threading.Thread(target=discover, daemon=True).start()
+    HTTPServer(("", HTTP_PORT), H).serve_forever()
