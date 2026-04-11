@@ -48,7 +48,6 @@ def save_torrent(info_hash, name, filenames, size):
     magnet = f"magnet:?xt=urn:btih:{info_hash}"
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    import json
     filenames_json = json.dumps(filenames, ensure_ascii=False)
     c.execute("INSERT OR REPLACE INTO torrents (info_hash, name, magnet, filenames, size) VALUES (?, ?, ?, ?, ?)", (info_hash, name, magnet, filenames_json, size))
     conn.commit()
@@ -62,7 +61,6 @@ def search_by_filename(query):
     c.execute("SELECT info_hash, name, magnet, filenames, size FROM torrents WHERE name LIKE ? OR filenames LIKE ?", 
               (f"%{query}%", f"%{query}%"))
     results = []
-    import json
     for row in c.fetchall():
         results.append({"info_hash": row[0], "name": row[1], "magnet": row[2], "filenames": json.loads(row[3]), "size": row[4]})
     conn.close()
@@ -231,9 +229,13 @@ class H(BaseHTTPRequestHandler):
             self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
             with lock: self.wfile.write(json.dumps({"total": len(torrents)}).encode())
         elif self.path.startswith("/api/search"):
+            import sys
             q = parse_qs(urlparse(self.path).query).get("q", [""])[0]
+            print(f"[DEBUG] search path={self.path}, q={q}", flush=True)
+            sys.stdout.flush()
             db_results = search_by_filename(q)
-            print(f"[SEARCH] q={q}, db={len(db_results)}")
+            print(f"[SEARCH] q={q}, db={len(db_results)}", flush=True)
+            sys.stdout.flush()
             if db_results:
                 results = db_results
             else:
@@ -247,7 +249,8 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition", f'attachment; filename="{info_hash}.torrent"')
             self.end_headers()
         elif self.path.startswith("/api/torrent/"):
-            info_hash = self.path.split("/api/torrent/")[1].strip("/")
+            info_hash = self.path.split("/api/torrent/")[1].strip("/").lower()
+            # 先从内存torrents查找
             with lock: t = torrents.get(info_hash)
             if t and t.get("torrent_file"):
                 try:
@@ -258,7 +261,49 @@ class H(BaseHTTPRequestHandler):
                     self.wfile.write(data)
                     return
                 except: pass
-            self.send_response(404); self.end_headers()
+            # 从数据库查找
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT name, size, filenames FROM torrents WHERE info_hash=?", (info_hash,))
+            row = c.fetchone()
+            conn.close()
+            if row:
+                name, size, filenames_json = row
+                filenames = json.loads(filenames_json) if filenames_json else []
+                # 生成最小化的.torrent文件
+                try:
+                    # 解析info_hash (hex -> bytes)
+                    info_hash_bytes = bytes.fromhex(info_hash)
+                    # 创建info字典
+                    info_dict = {
+                        b"name": name.encode("utf-8") if isinstance(name, str) else name,
+                        b"piece length": 262144,
+                        b"pieces": info_hash_bytes[:20],  # 用info_hash前20字节作为pieces占位
+                    }
+                    # 单文件还是多文件
+                    if len(filenames) <= 1:
+                        info_dict[b"length"] = size or 0
+                    else:
+                        info_dict[b"files"] = [
+                            {b"path": [f.encode("utf-8")], b"length": max(size // len(filenames), 0)}
+                            for f in filenames[:10]  # 限制最多10个文件
+                        ]
+                    # 构建完整torrent
+                    torrent_data = {
+                        b"announce": b"http://localhost:8080/announce",
+                        b"info": info_dict
+                    }
+                    data = bencoder.encode(torrent_data)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Disposition", f"attachment; filename={info_hash}.torrent")
+                    self.end_headers()
+                    self.wfile.write(data)
+                except Exception as e:
+                    print(f"[ERROR] 生成torrent失败: {e}")
+                    self.send_response(500); self.end_headers()
+            else:
+                self.send_response(404); self.end_headers()
         else:
             self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.end_headers()
             html = '''<html><head><meta charset="utf-8"><title>DHT Tracker</title>
