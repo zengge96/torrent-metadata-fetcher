@@ -29,6 +29,49 @@ except: pass
 
 import bencodepy as bencoder
 
+import sqlite3
+
+# 数据库路径
+DB_PATH = "/root/.openclaw/workspace/torrents.db"
+
+def init_db():
+    """初始化数据库"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS torrents (info_hash TEXT PRIMARY KEY, name TEXT, magnet TEXT, filenames TEXT, size INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_filenames ON torrents(filenames)")
+    conn.commit()
+    conn.close()
+    
+def save_torrent(info_hash, name, filenames, size):
+    """保存torrent到数据库"""
+    magnet = f"magnet:?xt=urn:btih:{info_hash}"
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    import json
+    filenames_json = json.dumps(filenames, ensure_ascii=False)
+    c.execute("INSERT OR REPLACE INTO torrents (info_hash, name, magnet, filenames, size) VALUES (?, ?, ?, ?, ?)", (info_hash, name, magnet, filenames_json, size))
+    conn.commit()
+    conn.close()
+    
+def search_by_filename(query):
+    """按文件名搜索"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    # 同时搜索name和filenames字段
+    c.execute("SELECT info_hash, name, magnet, filenames, size FROM torrents WHERE name LIKE ? OR filenames LIKE ?", 
+              (f"%{query}%", f"%{query}%"))
+    results = []
+    import json
+    for row in c.fetchall():
+        results.append({"info_hash": row[0], "name": row[1], "magnet": row[2], "filenames": json.loads(row[3]), "size": row[4]})
+    conn.close()
+    return results
+
+# 初始化数据库
+init_db()
+
+
 # ===== DHT Spider =====
 class DHTSpider:
     def __init__(self, port=DHT_PORT):
@@ -188,10 +231,21 @@ class H(BaseHTTPRequestHandler):
             self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
             with lock: self.wfile.write(json.dumps({"total": len(torrents)}).encode())
         elif self.path.startswith("/api/search"):
-            q = parse_qs(urlparse(self.path).query).get("q", [""])[0].lower()
-            with lock: results = [{"info_hash": k, **v} for k,v in torrents.items() if q in v.get("name","").lower() or q in k]
+            q = parse_qs(urlparse(self.path).query).get("q", [""])[0]
+            db_results = search_by_filename(q)
+            print(f"[SEARCH] q={q}, db={len(db_results)}")
+            if db_results:
+                results = db_results
+            else:
+                with lock: results = [{"info_hash": k, **v} for k,v in torrents.items() if q in v.get("name","").lower() or q in k]
             self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
             self.wfile.write(json.dumps(results).encode())
+        elif self.command == "HEAD" and self.path.startswith("/api/torrent/"):
+            info_hash = self.path.split("/api/torrent/")[1].split("?")[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-bittorrent")
+            self.send_header("Content-Disposition", f'attachment; filename="{info_hash}.torrent"')
+            self.end_headers()
         elif self.path.startswith("/api/torrent/"):
             info_hash = self.path.split("/api/torrent/")[1].strip("/")
             with lock: t = torrents.get(info_hash)
@@ -217,7 +271,7 @@ button{padding:12px 25px;font-size:16px;background:#238636;color:#fff;border:non
 </style></head>
 <body><h1>DHT爬虫 + Tracker</h1>
 <div class="stats">Found: <span id="c">0</span> torrents</div>
-<form action="/search"><input type="text" name="q" placeholder="Search by name or hash" autofocus><button>Search</button></form>
+<form action="/search"><input type="text" name="q" placeholder="Search by filename" autofocus><button>Search</button></form>
 <div id="results"></div>
 <script>
 function updateCount(){fetch('/api/stats').then(r=>r.json()).then(d=>document.getElementById('c').innerText=d.total)}
@@ -231,8 +285,11 @@ if(q){
       h+='<div class="result">';
       h+='<div class="hash">'+(x.name||x.info_hash)+'</div>';
       h+='<div class="info">Size: '+(x.size?(x.size/1024/1024/1024).toFixed(1)+' GB':'N/A')+'</div>';
-      h+='<div class="info">Peers: '+x.count+'</div>';
-      h+='<div class="info">magnet:?xt=urn:btih:'+x.info_hash+'</div>';
+      let magnet = x.magnet || "magnet:?xt=urn:btih:"+x.info_hash;
+      h+='<div class="info" style="word-break:break-all">'+magnet+'</div>';
+      if(x.filenames){
+        h+='<div class="info">Files: '+x.filenames.slice(0,5).join(", ")+(x.filenames.length>5?"...":"")+'</div>';
+      }
       h+='<div class="info"><a href="/api/torrent/'+x.info_hash+'" style="color:#4f" download>Download .torrent</a></div>';
       h+='</div>';
     });
