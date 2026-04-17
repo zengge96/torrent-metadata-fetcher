@@ -24,19 +24,21 @@
 - 各种任务生成的临时文件和临时目录应放到/root/.openclaw/workspace/user目录下，避免污染workspace目录。
 
 ## 记忆搜索和存储规则
-- 记忆的搜索使用 mempalace__mempalace_search
-- 记忆的存储使用 mempalace__mempalace_add_drawer
+- **禁止使用 memory_search（文件系统搜索）**
+- 记忆的搜索统一使用 mempalace_search（语义搜索）
+- 记忆的存储使用 mempalace_add_drawer
 - 写 Daily notes 时同步存到 MemPalace
 - Session 结束后调用 mempalace_diary_write 记录日记
 - 新会话启动时调用 mempalace_search 搜索近期项目上下文
+- **任何记忆操作前先读取 ~/.openclaw/skills/mempalace/SKILL.md**
 
 ## MemPalace 工具速查
+- **使用前必须先读取 ~/.openclaw/skills/mempalace/SKILL.md 了解详细用法**
 - 搜索: mempalace_search (query=关键词)
 - 存记忆: mempalace_add_drawer (wing=项目/人, room=主题, content=内容)
 - 查状态: mempalace_status
 - 写日记: mempalace_diary_write (agent_name=黑狗儿, entry=日记内容)
 - 查日记: mempalace_diary_read (agent_name=黑狗儿, last_n=5)
-- **使用前需先读取 ~/.openclaw/skills/mempalace/SKILL.md 了解详细用法**
 
 ## 消息重复的系统bug
 - 如果检测到重复消息，一般是系统可靠性机制重发的消息，请忽略。忽略的同时提醒用户收到重复消息，并给出消息message_id。
