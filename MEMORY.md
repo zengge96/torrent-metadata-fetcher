@@ -36,6 +36,7 @@
 - 查状态: mempalace_status
 - 写日记: mempalace_diary_write (agent_name=黑狗儿, entry=日记内容)
 - 查日记: mempalace_diary_read (agent_name=黑狗儿, last_n=5)
+- **使用前需先读取 ~/.openclaw/skills/mempalace/SKILL.md 了解详细用法**
 
 ## 消息重复的系统bug
 - 如果检测到重复消息，一般是系统可靠性机制重发的消息，请忽略。忽略的同时提醒用户收到重复消息，并给出消息message_id。
