@@ -24,9 +24,8 @@
 - 各种任务生成的临时文件和临时目录应放到/root/.openclaw/workspace/user目录下，避免污染workspace目录。
 
 ## 记忆搜索和存储规则
-- **禁止使用 memory_search（文件系统搜索）**
-- 记忆的搜索统一使用 mempalace_search（语义搜索）
-- 记忆的存储使用 mempalace_add_drawer
+- **优先使用 MemPalace**（mempalace_search/mempalace_add_drawer）
+- memory_search（文件系统搜索）仅作为 fallback
 - 写 Daily notes 时同步存到 MemPalace
 - Session 结束后调用 mempalace_diary_write 记录日记
 - 新会话启动时调用 mempalace_search 搜索近期项目上下文
